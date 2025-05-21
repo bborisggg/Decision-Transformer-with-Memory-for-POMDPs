@@ -108,6 +108,196 @@ class PositionalEncoding(nn.Module):
     def forward(self, x):
         return x + self.pe[:, :x.size(1)]
 
+class FFM(nn.Module):
+    def __init__(self, input_dim, memory_dim, context_dim):
+        super(FFM, self).__init__()
+        self.input_dim = input_dim
+        self.memory_dim = memory_dim
+        self.context_dim = context_dim
+        
+        # Learnable parameters for decay and context
+        self.alpha = nn.Parameter(torch.randn(memory_dim))
+        self.omega = nn.Parameter(torch.randn(context_dim))
+        
+        # Linear layers for input gating
+        self.W_x = nn.Linear(input_dim, memory_dim)
+        self.W_gate = nn.Linear(input_dim, memory_dim)
+        
+        # Projection layer from memory state to input_dim
+        self.W_proj = nn.Linear(memory_dim * context_dim * 2, input_dim)
+        
+    def forward(self, x, hidden_state):
+        batch_size, seq_len, _ = x.shape
+        if hidden_state is None:
+            S = torch.zeros(batch_size, self.memory_dim, self.context_dim, dtype=torch.cfloat, device=x.device)
+        else:
+            S = hidden_state
+        
+        outputs = []
+        for t in range(seq_len):
+            x_t = x[:, t, :]
+            
+            # Input gating
+            gate = torch.sigmoid(self.W_gate(x_t))
+            x_hat = self.W_x(x_t) * gate
+            
+            # Compute decay and context factor
+            gamma = torch.exp(-self.alpha.unsqueeze(1) - 1j * self.omega.unsqueeze(0))
+            
+            # Update memory state
+            S = gamma * S + x_hat.unsqueeze(2)
+            
+            # Project to real domain
+            z = torch.view_as_real(S).reshape(batch_size, -1)
+            output = self.W_proj(z)
+            outputs.append(output)
+        
+        memory_out = torch.stack(outputs, dim=1)
+        return memory_out, S
+
+class SHM(nn.Module):
+    def __init__(self, input_dim, memory_dim, L=128):
+        super(SHM, self).__init__()
+        self.input_dim = input_dim  # n_embed from state embeddings
+        self.memory_dim = memory_dim  # H in SHM
+        self.L = L  # Number of theta rows
+        
+        # Learnable parameter theta
+        self.theta = nn.Parameter(torch.randn(L, memory_dim))
+        
+        # Linear transformations
+        self.v_c = nn.Linear(input_dim, memory_dim)
+        self.v = nn.Linear(input_dim, memory_dim)
+        self.k = nn.Linear(input_dim, memory_dim)
+        self.q = nn.Linear(input_dim, memory_dim)
+        
+        # Update gate
+        self.eta = nn.Sequential(
+            nn.Linear(input_dim, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x, hidden_state):
+        batch_size, seq_length, _ = x.shape
+        # Initialize memory matrix if none provided
+        if hidden_state is None:
+            M = torch.zeros(batch_size, self.memory_dim, self.memory_dim, device=x.device)
+        else:
+            M = hidden_state
+        
+        outputs = []
+        for t in range(seq_length):
+            x_t = x[:, t, :]  # [batch, input_dim]
+            # Select theta_t cyclically
+            l_t = t % self.L
+            theta_t = self.theta[l_t]  # [memory_dim]
+            
+            # Calibration matrix C_t
+            v_c_t = self.v_c(x_t)  # [batch, memory_dim]
+            C_t = 1 + torch.tanh(theta_t.unsqueeze(0).unsqueeze(2) * v_c_t.unsqueeze(1))  # [batch, memory_dim, memory_dim]
+            
+            # Update matrix U_t
+            eta_t = self.eta(x_t)  # [batch, 1]
+            v_t = self.v(x_t)  # [batch, memory_dim]
+            k_t = self.k(x_t)  # [batch, memory_dim]
+            U_t = eta_t.unsqueeze(2) * (v_t.unsqueeze(2) * k_t.unsqueeze(1))  # [batch, memory_dim, memory_dim]
+            
+            # Update memory
+            M = M * C_t + U_t
+            
+            # Read operation
+            q_t = self.q(x_t)  # [batch, memory_dim]
+            h_t = torch.bmm(M, q_t.unsqueeze(2)).squeeze(2)  # [batch, memory_dim]
+            outputs.append(h_t)
+        
+        memory_out = torch.stack(outputs, dim=1)  # [batch, seq_length, memory_dim]
+        return memory_out, M
+
+
+class ARMTMemory(nn.Module):
+    def __init__(self, input_dim, memory_dim, segment_size=512, nonlinearity='dpfp3'):
+        super(ARMTMemory, self).__init__()
+        self.input_dim = input_dim
+        self.memory_dim = memory_dim
+        self.segment_size = segment_size
+        self.nonlinearity = nonlinearity
+        
+        # Linear projections for keys, values, queries, and importance scalars
+        self.W_K = nn.Linear(input_dim, memory_dim)
+        self.W_V = nn.Linear(input_dim, memory_dim)
+        self.W_Q = nn.Linear(input_dim, memory_dim)
+        self.W_beta = nn.Linear(input_dim, 1)
+    
+    def _apply_nonlinearity(self, x):
+        """Apply DPFP-3 non-linearity as per ARMT paper."""
+        if self.nonlinearity == 'dpfp3':
+            return torch.sign(x) * torch.abs(x) ** (1/3)
+        else:
+            raise ValueError("Unsupported nonlinearity")
+    
+    def forward(self, x, hidden_state=None):
+        batch_size, seq_length, _ = x.shape
+        num_segments = (seq_length + self.segment_size - 1) // self.segment_size
+        
+        # Initialize batched memory if not provided
+        if hidden_state is None:
+            A = torch.zeros(batch_size, self.memory_dim, self.memory_dim, device=x.device)
+            z = torch.zeros(batch_size, self.memory_dim, device=x.device)
+        else:
+            A, z = hidden_state
+        
+        outputs = []
+        for seg in range(num_segments):
+            start = seg * self.segment_size
+            end = min(start + self.segment_size, seq_length)
+            seg_x = x[:, start:end, :]  # [batch, seg_len, input_dim]
+            
+            # Generate keys, values, and importance scalars
+            keys = self.W_K(seg_x)  # [batch, seg_len, memory_dim]
+            values = self.W_V(seg_x)  # [batch, seg_len, memory_dim]
+            betas = torch.sigmoid(self.W_beta(seg_x))  # [batch, seg_len, 1]
+            
+            # Update memory for each token in segment
+            current_A = A
+            current_z = z
+            for t in range(seg_x.shape[1]):
+                k = keys[:, t, :]  # [batch, memory_dim]
+                v = values[:, t, :]  # [batch, memory_dim]
+                beta = betas[:, t, :]  # [batch, 1]
+                
+                phi_k = self._apply_nonlinearity(k)  # [batch, memory_dim]
+                # Compute previous association
+                z_phi_k = torch.bmm(current_z.unsqueeze(1), phi_k.unsqueeze(2)).squeeze(2)  # [batch, 1]
+                v_bar = torch.bmm(current_A, phi_k.unsqueeze(2)).squeeze(2) / (z_phi_k + 1e-8)  # [batch, memory_dim]
+                
+                # Compute gamma for normalization correction
+                phi_k_norm = torch.sum(phi_k ** 2, dim=1, keepdim=True)  # [batch, 1]
+                gamma = 1 - z_phi_k / (phi_k_norm + 1e-8)  # [batch, 1]
+                
+                # Update association matrix and normalization vector (out-of-place)
+                delta_v = beta * (v - v_bar)  # [batch, memory_dim]
+                current_A = current_A + torch.bmm(delta_v.unsqueeze(2), phi_k.unsqueeze(1))  # [batch, memory_dim, memory_dim]
+                current_z = current_z + gamma * phi_k  # [batch, memory_dim]
+            
+            # Update memory state for next iteration
+            A = current_A
+            z = current_z
+            
+            # Retrieve associations for current segment
+            queries = self.W_Q(seg_x)  # [batch, seg_len, memory_dim]
+            seg_out = []
+            for t in range(seg_x.shape[1]):
+                q = queries[:, t, :]  # [batch, memory_dim]
+                phi_q = self._apply_nonlinearity(q)  # [batch, memory_dim]
+                z_phi_q = torch.bmm(z.unsqueeze(1), phi_q.unsqueeze(2)).squeeze(2)  # [batch, 1]
+                y = torch.bmm(A, phi_q.unsqueeze(2)).squeeze(2) / (z_phi_q + 1e-8)  # [batch, memory_dim]
+                seg_out.append(y)
+            
+            outputs.append(torch.stack(seg_out, dim=1))  # [batch, seg_len, memory_dim]
+        
+        memory_out = torch.cat(outputs, dim=1)  # [batch, seq_length, memory_dim]
+        hidden_state = (A, z)
+        return memory_out, hidden_state
 
 class MemoryDecisionTransformer(nn.Module):
     def __init__(self, state_dim, n_actions, n_embed=128, n_layer=2, n_head=4, context_length=20, 
@@ -131,9 +321,21 @@ class MemoryDecisionTransformer(nn.Module):
         # Memory module (optional)
         if memory_type == 'gru':
             # TODO: Implement GRU memory
+            self.memory = nn.GRU(input_size=n_embed, hidden_size=memory_dim, num_layers=1, batch_first=True)
             self.memory_proj = nn.Linear(memory_dim, n_embed)
         elif memory_type == 'lstm':
             # TODO: Implement LSTM memory
+            self.memory = nn.LSTM(input_size=n_embed, hidden_size=memory_dim, num_layers=1, batch_first=True)
+            self.memory_proj = nn.Linear(memory_dim, n_embed)
+        elif memory_type == 'ffm':
+            # Fast and Forgetful Memory module
+            self.memory = FFM(input_dim=n_embed, memory_dim=memory_dim, context_dim=4)  # context_dim=4 as a reasonable default
+            self.memory_proj = nn.Identity()  # FFM outputs directly to n_embed
+        elif memory_type == 'shm':
+            self.memory = SHM(input_dim=n_embed, memory_dim=memory_dim, L=128)
+            self.memory_proj = nn.Linear(memory_dim, n_embed)
+        elif memory_type == 'armt':
+            self.memory = ARMTMemory(input_dim=n_embed, memory_dim=memory_dim, segment_size=512)
             self.memory_proj = nn.Linear(memory_dim, n_embed)
         else:
             self.memory = None
@@ -183,16 +385,21 @@ class MemoryDecisionTransformer(nn.Module):
         
         # add memory
         if self.memory is not None:
-            if self.memory_type == 'gru':
-                if self.hidden_state is None:
-                    # TODO: Implement GRU memory
-                
-                memory_out, self.hidden_state = self.memory(state_embeddings, self.hidden_state)
-            elif self.memory_type == 'lstm':
-                if self.hidden_state is None:
-                    # TODO: Implement LSTM memory
-                
-                memory_out, self.hidden_state = self.memory(state_embeddings, self.hidden_state)
+            if self.hidden_state is None:
+                if self.memory_type == 'gru':
+                    self.hidden_state = torch.zeros(1, batch_size, self.memory.hidden_size, device=states.device)
+                elif self.memory_type == 'lstm':
+                    h0 = torch.zeros(1, batch_size, self.memory.hidden_size, device=states.device)
+                    c0 = torch.zeros(1, batch_size, self.memory.hidden_size, device=states.device)
+                    self.hidden_state = (h0, c0)
+                elif self.memory_type == 'shm':
+                    self.hidden_state = torch.zeros(batch_size, self.memory.memory_dim, self.memory.memory_dim, device=states.device)
+                elif self.memory_type == 'ffm':
+                    self.hidden_state = None  # FFM initializes hidden state internally
+                elif self.memory_type == 'armt':
+                    self.hidden_state = None  # ARMT initializes A and z internally
+            
+            memory_out, self.hidden_state = self.memory(state_embeddings, self.hidden_state)
             
             # project memory to embedding dimension
             memory_embedding = self.memory_proj(memory_out)
@@ -882,7 +1089,7 @@ if __name__ == "__main__":
     parser.add_argument('--env', type=str, default='velocity_cartpole', 
                       choices=['velocity_cartpole', 'flickering_pendulum', 'lidar_mountain_car'], 
                       help='Environment name')
-    parser.add_argument('--memory', type=str, default='gru', choices=['gru', 'lstm', 'none'], 
+    parser.add_argument('--memory', type=str, default='gru', choices=['gru', 'lstm', 'ffm', 'shm','armt', 'none'], 
                       help='Memory type')
     parser.add_argument('--epochs', type=int, default=10, help='Number of epochs')
     
