@@ -1,3 +1,7 @@
+# PDF WITH REPORT
+
+[CLICK](Training_Report.pdf)
+
 # Advanced Reinforcement Learning Course @ AI Masters
 ## Homework 6: Decision Transformer with Memory
 
